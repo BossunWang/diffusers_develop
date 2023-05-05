@@ -18,6 +18,7 @@ from typing import Any, Callable, List, Optional, Union
 import numpy as np
 import PIL
 import torch
+import torch.nn.functional as F
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from ...loaders import TextualInversionLoaderMixin
@@ -372,7 +373,7 @@ class StableDiffusionUpscalePipeline(DiffusionPipeline, TextualInversionLoaderMi
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.decode_latents
     def decode_latents(self, latents):
         latents = 1 / self.vae.config.scaling_factor * latents
-        image = self.vae.decode(latents).sample
+        image = self.vae.decode(latents, return_dict=False)[0]
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -677,8 +678,12 @@ class StableDiffusionUpscalePipeline(DiffusionPipeline, TextualInversionLoaderMi
 
                 # predict the noise residual
                 noise_pred = self.unet(
-                    latent_model_input, t, encoder_hidden_states=prompt_embeds, class_labels=noise_level
-                ).sample
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    class_labels=noise_level,
+                    return_dict=False,
+                )[0]
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -686,7 +691,7 @@ class StableDiffusionUpscalePipeline(DiffusionPipeline, TextualInversionLoaderMi
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
@@ -697,15 +702,23 @@ class StableDiffusionUpscalePipeline(DiffusionPipeline, TextualInversionLoaderMi
         # 10. Post-processing
         # make sure the VAE is in float32 mode, as it overflows in float16
         self.vae.to(dtype=torch.float32)
-        image = self.decode_latents(latents.float())
 
-        # Offload last model to CPU
-        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-            self.final_offload_hook.offload()
+        # TODO(Patrick, William) - clean up when attention is refactored
+        use_torch_2_0_attn = hasattr(F, "scaled_dot_product_attention")
+        use_xformers = self.vae.decoder.mid_block.attentions[0]._use_memory_efficient_attention_xformers
+        # if xformers or torch_2_0 is used attention block does not need
+        # to be in float32 which can save lots of memory
+        if not use_torch_2_0_attn and not use_xformers:
+            self.vae.post_quant_conv.to(latents.dtype)
+            self.vae.decoder.conv_in.to(latents.dtype)
+            self.vae.decoder.mid_block.to(latents.dtype)
+        else:
+            latents = latents.float()
 
         # 11. Convert to PIL
-        # has_nsfw_concept = False
         if output_type == "pil":
+            image = self.decode_latents(latents)
+
             image, has_nsfw_concept, _ = self.run_safety_checker(image, device, prompt_embeds.dtype)
 
             image = self.numpy_to_pil(image)
@@ -713,8 +726,17 @@ class StableDiffusionUpscalePipeline(DiffusionPipeline, TextualInversionLoaderMi
             # 11. Apply watermark
             if self.watermarker is not None:
                 image = self.watermarker.apply_watermark(image)
-        else:
+        elif output_type == "pt":
+            latents = 1 / self.vae.config.scaling_factor * latents
+            image = self.vae.decode(latents).sample
             has_nsfw_concept = None
+        else:
+            image = self.decode_latents(latents)
+            has_nsfw_concept = None
+
+        # Offload last model to CPU
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
 
         if not return_dict:
             return (image, has_nsfw_concept)
