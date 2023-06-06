@@ -71,6 +71,7 @@ else:
         StableDiffusionPanoramaPipeline,
         StableDiffusionPipeline,
         StableDiffusionPix2PixZeroPipeline,
+        StableDiffusionPix2PixZeroPipelineDDPM,
         StableDiffusionSAGPipeline,
         StableDiffusionUpscalePipeline,
         StableUnCLIPImg2ImgPipeline,

@@ -82,6 +82,7 @@ else:
     from .pipeline_stable_diffusion_depth2img import StableDiffusionDepth2ImgPipeline
     from .pipeline_stable_diffusion_diffedit import StableDiffusionDiffEditPipeline
     from .pipeline_stable_diffusion_pix2pix_zero import StableDiffusionPix2PixZeroPipeline
+    from .pipeline_stable_diffusion_pix2pix_zero_ddpm_inversion import StableDiffusionPix2PixZeroPipelineDDPM
 
 
 try:

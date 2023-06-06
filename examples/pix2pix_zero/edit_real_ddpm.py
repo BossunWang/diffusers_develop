@@ -1,6 +1,6 @@
 import torch
 from transformers import BlipForConditionalGeneration, BlipProcessor, AutoTokenizer, T5ForConditionalGeneration
-from diffusers import StableDiffusionPipeline, DDIMScheduler, DDIMInverseScheduler, StableDiffusionPix2PixZeroPipeline
+from diffusers import StableDiffusionPipeline, DDIMScheduler, DDIMInverseScheduler, StableDiffusionPix2PixZeroPipelineDDPM
 from PIL import Image
 import pickle
 import numpy as np
@@ -106,7 +106,59 @@ def load_512(image_path, left=0, right=0, top=0, bottom=0, device=None):
     return image
 
 
-def zero_shot_I2I(caption, inv_latents, pipeline, generator, source_captions_fp, target_captions_fp, output_path):
+def DDPM_inversion(pipeline,
+                   ldm_stable,
+                   generator,
+                   num_diffusion_steps,
+                   raw_image,
+                   x0,
+                   source_prompt,
+                   target_prompt,
+                   source_captions_fp,
+                   target_captions_fp,
+                   eta,
+                   cfg_scale_src,
+                   skip,):
+    print("get caption from image:")
+    caption = pipeline.generate_caption(raw_image)
+    # caption = "a photography of a black and white kitten in a field of daies"
+    print("caption:", caption)
+
+    print("DDPM invert:")
+    # vae encode image
+    with autocast("cuda"), inference_mode():
+        w0 = (ldm_stable.vae.encode(x0).latent_dist.mode() * 0.18215).float()
+
+    wt, zs, wts = inversion_forward_process(ldm_stable, w0, etas=eta, prompt=caption, cfg_scale=cfg_scale_src,
+                                            prog_bar=True, num_inference_steps=num_diffusion_steps)
+    if wts is None:
+        print("inv_latents:", wt.shape)
+    else:
+        print("inv_latents:", wts[skip].shape)
+
+    # Generating source and target embeddings
+    # print("Generating source and target embeddings:")
+    # source_captions, target_captions = Generating_embeddings(source_prompt, target_prompt)
+    #
+    # with open(source_captions_fp, "wb") as fp:
+    #     pickle.dump(source_captions, fp)
+    # with open(target_captions_fp, "wb") as fp:
+    #     pickle.dump(target_captions, fp)
+
+    return caption, wts[skip].unsqueeze(0) if wts is not None else wt, zs
+
+
+def zero_shot_I2I(caption,
+                  inv_latents,
+                  zs,
+                  eta,
+                  skip,
+                  num_diffusion_steps,
+                  pipeline,
+                  generator,
+                  source_captions_fp,
+                  target_captions_fp,
+                  output_path):
     with open(source_captions_fp, "rb") as fp:
         source_captions = pickle.load(fp)
     with open(target_captions_fp, "rb") as fp:
@@ -123,11 +175,13 @@ def zero_shot_I2I(caption, inv_latents, pipeline, generator, source_captions_fp,
         caption,
         source_embeds=source_embeddings,
         target_embeds=target_embeddings,
-        num_inference_steps=50,
+        num_inference_steps=num_diffusion_steps,
         cross_attention_guidance_amount=0.15,
         generator=generator,
         latents=inv_latents,
         negative_prompt=caption,
+        eta=eta,
+        zs=zs[skip:]
     ).images[0]
     image.save(output_path)
 
@@ -140,7 +194,7 @@ def main():
                                                          low_cpu_mem_usage=True)
 
     sd_model_ckpt = "CompVis/stable-diffusion-v1-4"
-    pipeline = StableDiffusionPix2PixZeroPipeline.from_pretrained(
+    pipeline = StableDiffusionPix2PixZeroPipelineDDPM.from_pretrained(
         sd_model_ckpt,
         caption_generator=model,
         caption_processor=processor,
@@ -162,25 +216,73 @@ def main():
 
     raw_image = Image.open(img_path).convert("RGB").resize((512, 512))
 
-    # DDIM inversion
-    # get captions and inversion
+    # DDPM inversion
+    device_num = 0
+    device = f"cuda:{device_num}"
+    model_id = "CompVis/stable-diffusion-v1-4"
+    num_diffusion_steps = 100
+    ldm_stable = StableDiffusionPipeline.from_pretrained(model_id).to(device)
+    ldm_stable.scheduler = DDIMScheduler.from_config(model_id, subfolder="scheduler")
+    ldm_stable.scheduler.set_timesteps(num_diffusion_steps)
+    offsets = (0, 0, 0, 0)
+    x0 = load_512(img_path, *offsets, device)
+
     source_prompt = "cat"
     target_prompt = "dog"
 
     source_captions_fp = "cat_captions.pkl"
     target_captions_fp = "dog_captions.pkl"
 
-    caption, inv_latents = DDIM_inversion(pipeline,
-                                          generator,
-                                          raw_image,
-                                          source_prompt,
-                                          target_prompt,
-                                          source_captions_fp,
-                                          target_captions_fp)
+    eta = 1
+    cfg_scale_src = 3.5
+    skip = 36
+    caption, inv_latents, zs = DDPM_inversion(pipeline,
+                                              ldm_stable,
+                                              generator,
+                                              num_diffusion_steps,
+                                              raw_image,
+                                              x0,
+                                              source_prompt,
+                                              target_prompt,
+                                              source_captions_fp,
+                                              target_captions_fp,
+                                              eta,
+                                              cfg_scale_src,
+                                              skip)
+    inv_latents = inv_latents.half()
+
+    del ldm_stable
+
+    # # DDIM inversion
+    # # get captions and inversion
+    # source_prompt = "cat"
+    # target_prompt = "dog"
+    #
+    # source_captions_fp = "cat_captions.pkl"
+    # target_captions_fp = "dog_captions.pkl"
+    #
+    # caption, inv_latents = DDIM_inversion(pipeline,
+    #                                       generator,
+    #                                       raw_image,
+    #                                       source_prompt,
+    #                                       target_prompt,
+    #                                       source_captions_fp,
+    #                                       target_captions_fp)
 
     # Image-to-Image Translation
-    output_path = "edited_image_flan-t5_cat2dog.png"
-    zero_shot_I2I(caption, inv_latents, pipeline, generator, source_captions_fp, target_captions_fp, output_path)
+    # output_path = "edited_image_flan-t5_cat2dog.png"
+    output_path = "edited_image_flan-t5_cat2dog_DDPM.png"
+    zero_shot_I2I(caption,
+                  inv_latents,
+                  zs,
+                  eta,
+                  skip,
+                  num_diffusion_steps,
+                  pipeline,
+                  generator,
+                  source_captions_fp,
+                  target_captions_fp,
+                  output_path)
 
     # ---------------------
 
