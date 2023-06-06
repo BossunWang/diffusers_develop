@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -23,6 +24,7 @@ from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
 from ...configuration_utils import FrozenDict
+from ...image_processor import VaeImageProcessor
 from ...loaders import LoraLoaderMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...schedulers import DDIMInverseScheduler, KarrasDiffusionSchedulers
@@ -157,6 +159,11 @@ def kl_divergence(hidden_states):
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.preprocess
 def preprocess(image):
+    warnings.warn(
+        "The preprocess method is deprecated and will be removed in a future version. Please"
+        " use VaeImageProcessor.preprocess instead",
+        FutureWarning,
+    )
     if isinstance(image, torch.Tensor):
         return image
     elif isinstance(image, PIL.Image.Image):
@@ -357,6 +364,7 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
             inverse_scheduler=inverse_scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_vae_slicing
@@ -560,7 +568,7 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
             uncond_tokens: List[str]
             if negative_prompt is None:
                 uncond_tokens = [""] * batch_size
-            elif type(prompt) is not type(negative_prompt):
+            elif prompt is not None and type(prompt) is not type(negative_prompt):
                 raise TypeError(
                     f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
                     f" {type(prompt)}."
@@ -618,13 +626,17 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.run_safety_checker
     def run_safety_checker(self, image, device, dtype):
-        if self.safety_checker is not None:
-            safety_checker_input = self.feature_extractor(self.numpy_to_pil(image), return_tensors="pt").to(device)
+        if self.safety_checker is None:
+            has_nsfw_concept = None
+        else:
+            if torch.is_tensor(image):
+                feature_extractor_input = self.image_processor.postprocess(image, output_type="pil")
+            else:
+                feature_extractor_input = self.image_processor.numpy_to_pil(image)
+            safety_checker_input = self.feature_extractor(feature_extractor_input, return_tensors="pt").to(device)
             image, has_nsfw_concept = self.safety_checker(
                 images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
             )
-        else:
-            has_nsfw_concept = None
         return image, has_nsfw_concept
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
@@ -647,6 +659,11 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.decode_latents
     def decode_latents(self, latents):
+        warnings.warn(
+            "The decode_latents method is deprecated and will be removed in a future version. Please"
+            " use VaeImageProcessor instead",
+            FutureWarning,
+        )
         latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.decode(latents, return_dict=False)[0]
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -787,19 +804,25 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
 
         image = image.to(device=device, dtype=dtype)
 
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
+        if image.shape[1] == 4:
+            latents = image
 
-        if isinstance(generator, list):
-            latents = [self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)]
-            latents = torch.cat(latents, dim=0)
         else:
-            latents = self.vae.encode(image).latent_dist.sample(generator)
+            if isinstance(generator, list) and len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                    f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
 
-        latents = self.vae.config.scaling_factor * latents
+            if isinstance(generator, list):
+                latents = [
+                    self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+                ]
+                latents = torch.cat(latents, dim=0)
+            else:
+                latents = self.vae.encode(image).latent_dist.sample(generator)
+
+            latents = self.vae.config.scaling_factor * latents
 
         if batch_size != latents.shape[0]:
             if batch_size % latents.shape[0] == 0:
@@ -1052,7 +1075,7 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
 
         # 9. Convert to Numpy array or PIL.
         if output_type == "pil":
-            mask_image = self.numpy_to_pil(mask_image)
+            mask_image = self.image_processor.numpy_to_pil(mask_image)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
@@ -1287,7 +1310,7 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
 
         # 9. Convert to PIL.
         if decode_latents and output_type == "pil":
-            image = self.numpy_to_pil(image)
+            image = self.image_processor.numpy_to_pil(image)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
@@ -1510,15 +1533,19 @@ class StableDiffusionDiffEditPipeline(DiffusionPipeline, TextualInversionLoaderM
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        # 9. Post-processing
-        image = self.decode_latents(latents)
+        if not output_type == "latent":
+            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
+            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        else:
+            image = latents
+            has_nsfw_concept = None
 
-        # 10. Run safety checker
-        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+        if has_nsfw_concept is None:
+            do_denormalize = [True] * image.shape[0]
+        else:
+            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        # 11. Convert to PIL
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
+        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
